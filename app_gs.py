@@ -1,8 +1,10 @@
 import streamlit as st
 import hmac
+import hashlib
 import pandas as pd
 import calendar
 from datetime import datetime
+from urllib.parse import urlencode
 import re
 import csv
 import io
@@ -11,29 +13,147 @@ import uuid
 import gspread
 from google.oauth2.service_account import Credentials
 import streamlit.components.v1 as components
+from streamlit_autorefresh import st_autorefresh
 
+
+st.set_page_config(layout="wide")
+
+TOKEN_EXPIRE_SECONDS = 60 * 60 * 12
+
+def get_auth_users():
+    return st.secrets["auth"]["users"]
+
+def get_token_secret() -> str:
+    auth_section = st.secrets["auth"]
+    if "token_secret" in auth_section:
+        return str(auth_section["token_secret"])
+    seed = "|".join(
+        f"{user.get('username', '')}:{user.get('password', '')}"
+        for user in get_auth_users()
+    )
+    return hashlib.sha256((seed + "|ir_schedule_token").encode()).hexdigest()
+
+def make_login_token(username: str, expires_in: int = TOKEN_EXPIRE_SECONDS) -> str:
+    expires_at = int(datetime.now().timestamp()) + int(expires_in)
+    payload = f"{username}|{expires_at}"
+    signature = hmac.new(
+        get_token_secret().encode(),
+        payload.encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{username}.{expires_at}.{signature}"
+
+def find_saved_duty_image(year, month):
+    base_dir = "duty_images"
+    if not os.path.exists(base_dir):
+        return None
+
+    for file in os.listdir(base_dir):
+        if file.startswith(f"{year}_{month}"):
+            return os.path.join(base_dir, file)
+    return None
+
+
+def get_duty_image_path(year, month, ext):
+    base_dir = "duty_images"
+    os.makedirs(base_dir, exist_ok=True)
+    return os.path.join(base_dir, f"{year}_{month}.{ext}")
+
+def verify_login_token(token: str):
+    token = str(token or "").strip()
+    if not token:
+        return None
+    try:
+        username, expires_at_text, signature = token.split(".", 2)
+        expires_at = int(expires_at_text)
+    except Exception:
+        return None
+
+    if expires_at < int(datetime.now().timestamp()):
+        return None
+
+    payload = f"{username}|{expires_at}"
+    expected_signature = hmac.new(
+        get_token_secret().encode(),
+        payload.encode(),
+        hashlib.sha256,
+    ).hexdigest()
+
+    if not hmac.compare_digest(expected_signature, signature):
+        return None
+
+    for user in get_auth_users():
+        if hmac.compare_digest(str(user.get("username", "")), str(username)):
+            return str(username)
+    return None
+
+def set_login_state(username: str, token: str | None = None):
+    st.session_state["logged_in"] = True
+    st.session_state["username"] = str(username)
+    st.session_state["auth_token"] = token or make_login_token(str(username))
+
+def current_auth_token() -> str:
+    username = str(st.session_state.get("username", "")).strip()
+    token = str(st.session_state.get("auth_token", "")).strip()
+    verified_username = verify_login_token(token)
+    if username and verified_username == username:
+        return token
+    token = make_login_token(username)
+    st.session_state["auth_token"] = token
+    return token
+
+def app_query_string(**params) -> str:
+    query_params = {}
+    token = str(st.session_state.get("auth_token", "")).strip()
+    if token:
+        query_params["token"] = token
+    for key, value in params.items():
+        if value is None or value == "":
+            continue
+        query_params[key] = value
+    return "?" + urlencode(query_params, doseq=True) if query_params else ""
+
+def replace_query_params(**params):
+    st.query_params.clear()
+    token = str(st.session_state.get("auth_token", "")).strip()
+    if token:
+        st.query_params["token"] = token
+    for key, value in params.items():
+        if value is None or value == "":
+            continue
+        st.query_params[key] = value
+
+def clear_query_param(key: str):
+    if key in st.query_params:
+        del st.query_params[key]
 
 def check_login():
     if "logged_in" not in st.session_state:
         st.session_state["logged_in"] = False
     if "username" not in st.session_state:
         st.session_state["username"] = ""
+    if "auth_token" not in st.session_state:
+        st.session_state["auth_token"] = ""
 
-    if st.session_state["logged_in"]:
+    token_user = verify_login_token(st.query_params.get("token"))
+    if token_user:
+        set_login_state(token_user, st.query_params.get("token"))
         return
 
-    st.set_page_config(layout="wide")
+    if st.session_state["logged_in"]:
+        if not st.session_state.get("auth_token"):
+            st.session_state["auth_token"] = make_login_token(st.session_state["username"])
+        return
+
     st.title("로그인")
 
     username = st.text_input("ID", key="login_username")
     password = st.text_input("PW", type="password", key="login_password")
 
     if st.button("로그인", key="login_button"):
-        users = st.secrets["auth"]["users"]
-
         matched_user = next(
             (
-                user for user in users
+                user for user in get_auth_users()
                 if hmac.compare_digest(str(user["username"]), str(username))
                 and hmac.compare_digest(str(user["password"]), str(password))
             ),
@@ -41,14 +161,13 @@ def check_login():
         )
 
         if matched_user:
-            st.session_state["logged_in"] = True
-            st.session_state["username"] = str(username)
+            set_login_state(str(username))
+            replace_query_params()
             st.rerun()
         else:
             st.error("ID 또는 PW가 올바르지 않습니다.")
 
     st.stop()
-
 
 def render_logout():
     right1, right2 = st.columns([8.5, 1.5])
@@ -56,14 +175,14 @@ def render_logout():
         if st.button(f"로그아웃", use_container_width=True, key="logout_button"):
             st.session_state["logged_in"] = False
             st.session_state["username"] = ""
+            st.session_state["auth_token"] = ""
+            st.query_params.clear()
             st.rerun()
-
 
 check_login()
 SPREADSHEET_NAME = "IR_schedule"
 PROCEDURES_SHEET = "procedures"
 VACATION_SHEET = "vacation_notes"
-
 
 DELETE_PASSWORD = "0000"
 DATA_FILE = "procedures.csv"
@@ -78,20 +197,12 @@ SPREADSHEET_NAME = "IR_schedule"
 PROCEDURES_SHEET = "procedures"
 VACATION_SHEET = "vacation_notes"
 
-
-
 STATUS_PLANNED = "예정"
 STATUS_CALLED = "호출"
 STATUS_INROOM = "입실"
 STATUS_DONE = "시술완료"
 
-
-
-
 VALID_STATUSES = [STATUS_PLANNED, STATUS_CALLED, STATUS_INROOM, STATUS_DONE]
-
-
-
 
 STATUS_COLORS = {
     STATUS_PLANNED: "#9aa0a6",
@@ -99,9 +210,6 @@ STATUS_COLORS = {
     STATUS_INROOM: "#ef4444",
     STATUS_DONE: "#38bdf8",
 }
-
-
-
 
 COLUMNS = [
     "id", "updated_at",
@@ -116,14 +224,7 @@ COLUMNS = [
     "메모"
 ]
 
-
-
-
 VACATION_COLUMNS = ["id", "updated_at", "날짜", "메모", "잠금"]
-
-
-
-
 
 def get_prof_options(proc_dept: str):
     mapping = {
@@ -133,49 +234,44 @@ def get_prof_options(proc_dept: str):
     }
     return mapping.get(proc_dept, [])
 
-
-
-
-
-
-
-
 def get_prof_select_options(proc_dept: str):
     return [""] + get_prof_options(proc_dept)
-
-
-
-
-
-
-
 
 def empty_procedures_df():
     return pd.DataFrame(columns=COLUMNS)
 
-
 def empty_vacation_df():
     return pd.DataFrame(columns=VACATION_COLUMNS)
-
 
 def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
-
 def truthy(value) -> bool:
     return str(value).strip().lower() in ["true", "1", "y", "yes"]
 
+def normalize_room_value(value) -> str:
+    room_text = "" if value is None or pd.isna(value) else str(value).strip()
+    room_map = {
+        "1번방": "1",
+        "2번방": "2",
+        "1.0": "1",
+        "2.0": "2",
+        "ROOM": "",
+        "Room": "",
+        "nan": "",
+        "None": "",
+    }
+    room_text = room_map.get(room_text, room_text)
+    return room_text if room_text in ["", "1", "2", "H"] else ""
 
 def sheet_enabled() -> bool:
     return "gcp_service_account" in st.secrets
-
 
 @st.cache_resource
 def get_gspread_client():
     creds_dict = dict(st.secrets["gcp_service_account"])
     creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
     return gspread.authorize(creds)
-
 
 @st.cache_resource
 def get_workbook():
@@ -228,7 +324,6 @@ def record_to_row(record: dict, header: list[str]):
             row.append(str(value))
     return row
 
-
 def sheet_records_to_df(rows: list[dict], columns: list[str]) -> pd.DataFrame:
     if not rows:
         df = pd.DataFrame(columns=columns)
@@ -240,7 +335,6 @@ def sheet_records_to_df(rows: list[dict], columns: list[str]) -> pd.DataFrame:
             df[col] = ""
 
     return df[columns].copy()
-
 
 def normalize_procedures_df(df: pd.DataFrame) -> pd.DataFrame:
     for col in COLUMNS:
@@ -269,11 +363,10 @@ def normalize_procedures_df(df: pd.DataFrame) -> pd.DataFrame:
 
     df["진행상황"] = df["진행상황"].replace({"완료": STATUS_DONE})
     df["진행상황"] = df["진행상황"].apply(lambda x: x if x in VALID_STATUSES else STATUS_PLANNED)
-    df["Room"] = df["Room"].replace({"1번방": "1", "2번방": "2", "Room": ""})
+    df["Room"] = df["Room"].apply(normalize_room_value)
     if "시술과" not in df.columns:
         df["시술과"] = "IR"
     return df
-
 
 def normalize_vacation_df(df: pd.DataFrame) -> pd.DataFrame:
     for col in VACATION_COLUMNS:
@@ -293,10 +386,9 @@ def normalize_vacation_df(df: pd.DataFrame) -> pd.DataFrame:
     df["잠금"] = df["잠금"].apply(truthy)
     return df
 
-
 def load_data():
     if sheet_enabled():
-        ws = get_or_create_worksheet(PROCEDURES_SHEET, COLUMNS)
+        ws = get_worksheet(PROCEDURES_SHEET)
         rows = ws.get_all_records()
         return normalize_procedures_df(sheet_records_to_df(rows, COLUMNS))
 
@@ -313,7 +405,6 @@ def load_data():
 
     return normalize_procedures_df(df)
 
-
 def save_data(df: pd.DataFrame):
     save_df = normalize_procedures_df(df.copy())
     bool_cols = ["응급", "동의서", "감염", "ADR", "신기능", "출혈"]
@@ -323,13 +414,12 @@ def save_data(df: pd.DataFrame):
             save_df[col] = save_df[col].apply(lambda x: True if bool(x) else False)
 
     if sheet_enabled():
-        ws = get_or_create_worksheet(PROCEDURES_SHEET, COLUMNS)
+        ws = get_worksheet(PROCEDURES_SHEET)
         ws.clear()
         ws.update("A1", [COLUMNS] + save_df[COLUMNS].astype(str).values.tolist())
         return
 
     save_df.to_csv(DATA_FILE, index=False, encoding="utf-8-sig")
-
 
 def load_vacation_data():
     ws = get_worksheet(VACATION_SHEET)
@@ -381,32 +471,27 @@ def load_vacation_data():
 
     return df[VACATION_COLUMNS + ["_sheet_row"]]
 
-
 def save_vacation_data(df: pd.DataFrame):
     save_df = normalize_vacation_df(df.copy())
     save_df["잠금"] = save_df["잠금"].apply(lambda x: True if bool(x) else False)
 
     if sheet_enabled():
-        ws = get_or_create_worksheet(VACATION_SHEET, VACATION_COLUMNS)
+        ws = get_worksheet(PROCEDURES_SHEET)
         ws.clear()
         ws.update("A1", [VACATION_COLUMNS] + save_df[VACATION_COLUMNS].astype(str).values.tolist())
         return
 
     save_df.to_csv(VACATION_FILE, index=False, encoding="utf-8-sig")
 
-
 def refresh_procedures():
     st.session_state["procedures"] = load_data()
-
 
 def refresh_vacation_notes():
     st.session_state["vacation_notes"] = load_vacation_data()
 
-
 def get_df_index_by_id(df: pd.DataFrame, row_id: str):
     matches = df.index[df["id"].astype(str) == str(row_id)].tolist()
     return matches[0] if matches else None
-
 
 def find_sheet_row_by_id(ws, row_id: str):
     values = ws.get_all_values()
@@ -423,12 +508,11 @@ def find_sheet_row_by_id(ws, row_id: str):
             return row_num, header
     return None, header
 
-
 def update_procedure_record(row_id: str, updates: dict):
     if not sheet_enabled():
         return
 
-    ws = get_or_create_worksheet(PROCEDURES_SHEET, COLUMNS)
+    ws = get_worksheet(PROCEDURES_SHEET)
     row_num, header = find_sheet_row_by_id(ws, row_id)
     if row_num is None:
         return
@@ -439,14 +523,13 @@ def update_procedure_record(row_id: str, updates: dict):
     record["updated_at"] = now_iso()
     ws.update(f"A{row_num}:{gspread.utils.rowcol_to_a1(row_num, len(header))}", [record_to_row(record, header)])
 
-
 def append_procedure_record(record: dict):
     record = dict(record)
     record["id"] = record.get("id") or str(uuid.uuid4())
     record["updated_at"] = now_iso()
 
     if sheet_enabled():
-        ws = get_or_create_worksheet(PROCEDURES_SHEET, COLUMNS)
+        ws = get_worksheet(PROCEDURES_SHEET)
         header = ws.row_values(1) or COLUMNS
         ws.append_row(record_to_row(record, header))
         return
@@ -454,16 +537,14 @@ def append_procedure_record(record: dict):
     df = load_data()
     save_data(pd.concat([df, pd.DataFrame([record])], ignore_index=True))
 
-
 def delete_procedure_record(row_id: str):
     if not sheet_enabled():
         return
 
-    ws = get_or_create_worksheet(PROCEDURES_SHEET, COLUMNS)
+    ws = get_worksheet(PROCEDURES_SHEET)
     row_num, _ = find_sheet_row_by_id(ws, row_id)
     if row_num is not None:
         ws.delete_rows(row_num)
-
 
 def upsert_vacation_note_record(date_str: str, memo: str, locked: bool):
     ws = get_worksheet(VACATION_SHEET)
@@ -522,7 +603,6 @@ def upsert_vacation_note_record(date_str: str, memo: str, locked: bool):
 
     ws.append_row(row_data)
 
-
 def ensure_vacation_row(date_str):
     return
 
@@ -575,8 +655,6 @@ def save_vacation_note(date_str: str, memo: str, locked: bool):
 
     st.session_state["vacation_notes"] = vac_df
 
-
-
 @st.dialog("휴가/부재 메모")
 def vacation_note_dialog(date_str: str):
     memo_text, _ = get_vacation_note(date_str)
@@ -605,15 +683,8 @@ def vacation_note_dialog(date_str: str):
             save_vacation_note(date_str, "", False)
             st.rerun()
 
-
-
-
-
-
 if "procedures" not in st.session_state:
     st.session_state["procedures"] = load_data()
-
-
 
 if "calendar_year" not in st.session_state:
     today0 = datetime.today()
@@ -622,17 +693,9 @@ if "calendar_year" not in st.session_state:
 if "vacation_notes" not in st.session_state:
     st.session_state["vacation_notes"] = load_vacation_data()
 
-
 if "calendar_month" not in st.session_state:
     today0 = datetime.today()
     st.session_state["calendar_month"] = today0.month
-
-
-
-
-
-
-
 
 def normalize_gender(value):
     if pd.isna(value):
@@ -644,26 +707,12 @@ def normalize_gender(value):
         return "F"
     return str(value).strip()
 
-
-
-
-
-
-
-
 def normalize_age(value):
     if pd.isna(value):
         return 0
     s = str(value).strip()
     match = re.search(r"\d+", s)
     return int(match.group()) if match else 0
-
-
-
-
-
-
-
 
 def reindex_day_orders(target_date):
     df = st.session_state["procedures"].copy()
@@ -677,170 +726,112 @@ def reindex_day_orders(target_date):
             update_procedure_record(row["id"], {"순서": new_order})
 
     st.session_state["procedures"] = df
-    if not sheet_enabled():
+    if not sheet_enabled():         
         save_data(df)
-
-
-
-
-
-
-
 
 def extract_ward_text(admission_text: str) -> str:
     if admission_text is None:
         return "외래"
 
-
-
-
     s = str(admission_text).strip()
     if s == "":
         return "외래"
 
-
-
-
     if "외래" in s:
         return "외래"
-
-
-
 
     m = re.search(r"\((.*?)\)", s)
     if m:
         inside = m.group(1)
         parts = [p.strip() for p in inside.split(",") if p.strip()]
-        if len(parts) >= 2:
-            return parts[-1]
-        if len(parts) == 1:
-            return parts[0]
-
-
-
+        if len(parts) >= 1:
+            return ",".join(parts)  
 
     m2 = re.search(r"(\d{2,4}-\d{1,2})", s)
     if m2:
         return m2.group(1)
 
-
-
-
     if "입원" in s:
         return "입원"
 
-
-
-
     return "외래"
 
+def extract_emr_n_ward_text(ward_text: str) -> str:
+    if ward_text is None:
+        return ""
 
+    s = str(ward_text).strip()
+    if s == "" or s.lower() in ["nan", "none"]:
+        return ""
 
+    # 10BW(1034) -> 그대로 유지
+    m = re.match(r"^([A-Za-z0-9\-]+)\(([^()]+)\)$", s)
+    if m:
+        ward = m.group(1).strip()
+        room = m.group(2).strip()
+        return f"{ward}({room})"
 
+    # 혹시 괄호 앞뒤 공백이 섞여 있어도 정리
+    m2 = re.match(r"^(.+?)\s*\(\s*([^()]+)\s*\)$", s)
+    if m2:
+        ward = m2.group(1).strip()
+        room = m2.group(2).strip()
+        return f"{ward}({room})"
 
-
-
+    # 그 외는 원문 유지
+    return s
 
 def infer_procedure_text(text: str) -> str:
     if text is None or pd.isna(text):
         return ""
 
-
-
-
     lines = re.split(r'[\r\n]+', str(text))
-
-
-
 
     for line in lines:
         line = line.strip()
-
-
-
 
         if "시행하겠습니다" in line:
             before = line.split("시행하겠습니다")[0].strip()
             return before.rstrip(" ,.:;/-")
 
-
-
-
     return ""
-
-
-
 
     if text is None or pd.isna(text):
         return ""
-
-
-
 
     t = str(text).strip()
     if not t:
         return ""
 
-
-
-
     t = re.sub(r"\s+", " ", t).strip()
-
-
-
 
     m = re.search(r"(.+?)\s*시행하겠습니다", t)
     if not m:
         return ""
 
-
-
-
     return m.group(1).strip(" ,.:;/-")
-
-
-
-
 
 def parse_emr_text_to_dataframe(raw_text: str) -> pd.DataFrame:
     if not raw_text or raw_text.strip() == "":
         return pd.DataFrame()
 
-
-
-
     sio = io.StringIO(raw_text)
     reader = csv.reader(sio, delimiter="\t", quotechar='"')
     rows = list(reader)
 
-
-
-
     if not rows:
         return pd.DataFrame()
-
-
-
 
     cleaned_rows = []
     for row in rows:
         if row and any(str(cell).strip() != "" for cell in row):
             cleaned_rows.append(row)
 
-
-
-
     if len(cleaned_rows) < 2:
         return pd.DataFrame()
 
-
-
-
     header = cleaned_rows[0]
     data_rows = cleaned_rows[1:]
-
-
-
 
     fixed_rows = []
     ncol = len(header)
@@ -851,17 +842,48 @@ def parse_emr_text_to_dataframe(raw_text: str) -> pd.DataFrame:
             row = row[:ncol]
         fixed_rows.append(row)
 
-
-
-
     return pd.DataFrame(fixed_rows, columns=header)
 
+def map_emr_n_proc_dept(dept_text: str) -> str:
+    dept = "" if dept_text is None or pd.isna(dept_text) else str(dept_text).strip()
+    mapping = {
+        "신경외과": "NS",
+        "신경과": "NU",
+    }
+    return mapping.get(dept, "")
 
+def parse_emr_n_text_to_dataframe(raw_text: str) -> pd.DataFrame:
+    if not raw_text or raw_text.strip() == "":
+        return pd.DataFrame()
 
+    sio = io.StringIO(raw_text)
+    reader = csv.reader(sio, delimiter="\t", quotechar='"')
+    rows = list(reader)
 
+    if not rows:
+        return pd.DataFrame()
 
+    cleaned_rows = []
+    for row in rows:
+        if row and any(str(cell).strip() != "" for cell in row):
+            cleaned_rows.append(row)
 
+    if len(cleaned_rows) < 2:
+        return pd.DataFrame()
 
+    header = cleaned_rows[0]
+    data_rows = cleaned_rows[1:]
+
+    fixed_rows = []
+    ncol = len(header)
+    for row in data_rows:
+        if len(row) < ncol:
+            row = row + [""] * (ncol - len(row))
+        elif len(row) > ncol:
+            row = row[:ncol]
+        fixed_rows.append(row)
+
+    return pd.DataFrame(fixed_rows, columns=header)
 
 def set_status(row_id, status):
     if status not in VALID_STATUSES:
@@ -882,7 +904,6 @@ def set_status(row_id, status):
     else:
         save_data(df)
 
-
 def set_emergency(row_id, value):
     df = st.session_state["procedures"].copy()
     idx = get_df_index_by_id(df, row_id)
@@ -899,7 +920,6 @@ def set_emergency(row_id, value):
         update_procedure_record(row_id, {"응급": emergency_value})
     else:
         save_data(df)
-
 
 def toggle_consent(row_id):
     df = st.session_state["procedures"].copy()
@@ -922,7 +942,6 @@ def toggle_consent(row_id):
     else:
         save_data(df)
 
-
 def save_infection_info(row_id, infection_text):
     df = st.session_state["procedures"].copy()
     idx = get_df_index_by_id(df, row_id)
@@ -942,7 +961,6 @@ def save_infection_info(row_id, infection_text):
         update_procedure_record(row_id, {"감염": infection_on, "감염메모": text if infection_on else ""})
     else:
         save_data(df)
-
 
 def save_adr_info(row_id, adr_text):
     df = st.session_state["procedures"].copy()
@@ -964,7 +982,6 @@ def save_adr_info(row_id, adr_text):
     else:
         save_data(df)
 
-
 def save_renal_info(row_id, cr_text):
     df = st.session_state["procedures"].copy()
     idx = get_df_index_by_id(df, row_id)
@@ -984,7 +1001,6 @@ def save_renal_info(row_id, cr_text):
         update_procedure_record(row_id, {"신기능": renal_on, "Cr": text if renal_on else ""})
     else:
         save_data(df)
-
 
 def save_bleeding_info(row_id, pt_inr_text, plt_text):
     df = st.session_state["procedures"].copy()
@@ -1012,7 +1028,6 @@ def save_bleeding_info(row_id, pt_inr_text, plt_text):
     else:
         save_data(df)
 
-
 def status_badge(label: str, status_type: str):
     bg = STATUS_COLORS.get(status_type, "#9aa0a6")
     st.markdown(
@@ -1033,7 +1048,6 @@ def status_badge(label: str, status_type: str):
         unsafe_allow_html=True,
     )
 
-
 def get_display_day_df(df: pd.DataFrame, selected_date: str) -> pd.DataFrame:
     day_df = df[df["날짜"] == selected_date].copy()
     status_priority = {
@@ -1045,7 +1059,6 @@ def get_display_day_df(df: pd.DataFrame, selected_date: str) -> pd.DataFrame:
     day_df["status_priority"] = day_df["진행상황"].map(status_priority).fillna(2)
     return day_df.sort_values(["status_priority", "순서"], ascending=[True, True])
 
-
 def prev_month():
     y = st.session_state["calendar_year"]
     m = st.session_state["calendar_month"]
@@ -1054,7 +1067,6 @@ def prev_month():
         st.session_state["calendar_month"] = 12
     else:
         st.session_state["calendar_month"] = m - 1
-
 
 def next_month():
     y = st.session_state["calendar_year"]
@@ -1065,49 +1077,88 @@ def next_month():
     else:
         st.session_state["calendar_month"] = m + 1
 
-
-def update_inline_row(row_id, proc_dept, procedure_value, room, prof, memo_value):
+def update_memo(row_id, memo_value):
     df = st.session_state["procedures"].copy()
     idx = get_df_index_by_id(df, row_id)
     if idx is None:
         refresh_procedures()
         return
 
-    old_proc_dept = "" if pd.isna(df.at[idx, "시술과"]) else str(df.at[idx, "시술과"])
-    old_procedure = "" if pd.isna(df.at[idx, "시술명"]) else str(df.at[idx, "시술명"])
-    old_room = "" if pd.isna(df.at[idx, "Room"]) else str(df.at[idx, "Room"])
-    old_prof = "" if pd.isna(df.at[idx, "교수"]) else str(df.at[idx, "교수"])
     old_memo = "" if pd.isna(df.at[idx, "메모"]) else str(df.at[idx, "메모"])
+    new_memo = "" if memo_value is None else str(memo_value)
 
-    changed = (
-        old_proc_dept != str(proc_dept) or
-        old_procedure != str(procedure_value) or
-        old_room != str(room) or
-        old_prof != str(prof) or
-        old_memo != str(memo_value)
-    )
+    if old_memo == new_memo:
+        return
 
-    if changed:
-        df.at[idx, "시술과"] = proc_dept
-        df.at[idx, "시술명"] = procedure_value
-        df.at[idx, "Room"] = room
-        df.at[idx, "교수"] = prof
-        df.at[idx, "메모"] = memo_value
-        df.at[idx, "updated_at"] = now_iso()
-        st.session_state["procedures"] = df
+    df.at[idx, "메모"] = new_memo
+    df.at[idx, "updated_at"] = now_iso()
+    st.session_state["procedures"] = df
 
-        updates = {
-            "시술과": proc_dept,
-            "시술명": procedure_value,
-            "Room": room,
-            "교수": prof,
-            "메모": memo_value,
-        }
-        if sheet_enabled():
-            update_procedure_record(row_id, updates)
+    if sheet_enabled():
+        update_procedure_record(row_id, {"메모": new_memo})
+    else:
+        save_data(df)
+
+def update_procedure_edit_fields(
+    row_id,
+    reg_id,
+    name,
+    ward,
+    proc_dept,
+    procedure_value,
+    room,
+    prof,
+    req_dept,
+    req_doctor,
+    emergency_value,
+    memo_value,
+):
+    df = st.session_state["procedures"].copy()
+    idx = get_df_index_by_id(df, row_id)
+    if idx is None:
+        refresh_procedures()
+        return
+
+    normalized_updates = {
+        "등록번호": "" if reg_id is None else str(reg_id).strip(),
+        "이름": "" if name is None else str(name).strip(),
+        "병실": "" if ward is None else str(ward).strip(),
+        "시술과": "IR" if proc_dept not in ["IR", "NS", "NU"] else proc_dept,
+        "시술명": "" if procedure_value is None else str(procedure_value).strip(),
+        "Room": normalize_room_value(room),
+        "교수": "" if prof is None else str(prof).strip(),
+        "의뢰과": "" if req_dept is None else str(req_dept).strip(),
+        "의뢰의": "" if req_doctor is None else str(req_doctor).strip(),
+        "응급": str(emergency_value).strip() == "🚑",
+        "메모": "" if memo_value is None else str(memo_value).strip(),
+    }
+
+    changed = False
+    for col, new_value in normalized_updates.items():
+        current_value = df.at[idx, col]
+        if isinstance(new_value, bool):
+            if bool(current_value) != new_value:
+                changed = True
+                break
         else:
-            save_data(df)
+            current_text = "" if pd.isna(current_value) else str(current_value).strip()
+            if current_text != str(new_value).strip():
+                changed = True
+                break
 
+    if not changed:
+        return
+
+    for col, new_value in normalized_updates.items():
+        df.at[idx, col] = new_value
+
+    df.at[idx, "updated_at"] = now_iso()
+    st.session_state["procedures"] = df
+
+    if sheet_enabled():
+        update_procedure_record(row_id, normalized_updates)
+    else:
+        save_data(df)
 
 def get_day_case_summary(df: pd.DataFrame, date_str: str):
     day_df = df[df["날짜"] == date_str].copy()
@@ -1125,7 +1176,6 @@ def format_date_with_weekday(date_str: str) -> str:
         return f"{date_str}({weekday_kr})"
     except Exception:
         return str(date_str)
-
 
 def format_term_from_today(date_str: str) -> str:
     try:
@@ -1158,15 +1208,8 @@ def get_month_case_total(df: pd.DataFrame, year: int, month: int) -> int:
     month_df = df[df["날짜"].astype(str).str.startswith(prefix)].copy()
     return len(month_df)
 
-
-
-
 def render_rank_table(df: pd.DataFrame):
     st.dataframe(df, use_container_width=True, hide_index=True)
-
-
-
-
 
 @st.dialog("시술 삭제")
 def delete_dialog(row_id):
@@ -1197,12 +1240,57 @@ def delete_dialog(row_id):
         else:
             st.error("비밀번호가 틀렸습니다")
 
+@st.dialog("시술 정보 수정")
+def edit_procedure_dialog(row_id):
+    df = st.session_state["procedures"].copy()
+    idx = get_df_index_by_id(df, row_id)
+    if idx is None:
+        st.error("대상 행을 찾지 못했습니다.")
+        return
 
+    row = df.loc[idx]
+    proc_dept_options = ["IR", "NS", "NU"]
+    room_options = ["", "1", "2", "H"]
+    current_proc_dept = row["시술과"] if row["시술과"] in proc_dept_options else "IR"
+    current_room = normalize_room_value(row.get("Room", ""))
+    current_emergency = "🚑" if bool(row.get("응급", False)) else "N"
 
+    reg_id = st.text_input("등록번호", value="" if pd.isna(row["등록번호"]) else str(row["등록번호"]))
+    name = st.text_input("이름", value="" if pd.isna(row["이름"]) else str(row["이름"]))
+    ward = st.text_input("병실", value="" if pd.isna(row["병실"]) else str(row["병실"]))
 
+    c1, c2 = st.columns(2)
+    proc_dept = c1.selectbox("시술과", proc_dept_options, index=proc_dept_options.index(current_proc_dept))
+    room = c2.selectbox("Room", room_options, index=room_options.index(current_room))
 
+    procedure_value = st.text_input("시술명", value="" if pd.isna(row["시술명"]) else str(row["시술명"]))
+    prof_options = get_prof_select_options(proc_dept)
+    current_prof = row["교수"] if row["교수"] in prof_options else ""
+    prof = st.selectbox("시술의", prof_options, index=prof_options.index(current_prof))
 
+    c3, c4 = st.columns(2)
+    req_dept = c3.text_input("의뢰과", value="" if pd.isna(row["의뢰과"]) else str(row["의뢰과"]))
+    req_doctor = c4.text_input("의뢰의", value="" if pd.isna(row["의뢰의"]) else str(row["의뢰의"]))
 
+    memo_value = st.text_area("메모", value="" if pd.isna(row.get("메모", "")) else str(row.get("메모", "")), height=100)
+    emergency_value = st.selectbox("응급", ["N", "🚑"], index=0 if current_emergency == "N" else 1)
+
+    if st.button("확인", key=f"edit_confirm_{row_id}", use_container_width=True):
+        update_procedure_edit_fields(
+            row_id,
+            reg_id,
+            name,
+            ward,
+            proc_dept,
+            procedure_value,
+            room,
+            prof,
+            req_dept,
+            req_doctor,
+            emergency_value,
+            memo_value,
+        )
+        st.rerun()
 
 @st.dialog("시술의 Ranking")
 def ranking_dialog(selected_date):
@@ -1210,15 +1298,9 @@ def ranking_dialog(selected_date):
     day_df = df[df["날짜"] == selected_date].copy()
     day_df = day_df[day_df["교수"].astype(str).str.strip() != ""].copy()
 
-
-
-
     if day_df.empty:
         st.info("표시할 시술의 데이터가 없습니다.")
         return
-
-
-
 
     rank_df = (
         day_df.groupby("교수")
@@ -1228,25 +1310,12 @@ def ranking_dialog(selected_date):
         .reset_index(drop=True)
     )
 
-
-
-
     rank_df["시술의"] = rank_df["교수"]
     if len(rank_df) > 0:
         rank_df.loc[0, "시술의"] = f"{rank_df.loc[0, '교수']} 🥇"
 
-
-
-
     show_df = rank_df[["시술의", "건수"]].copy()
     render_rank_table(show_df)
-
-
-
-
-
-
-
 
 @st.dialog("월간 Ranking")
 def monthly_ranking_dialog(year: int, month: int):
@@ -1254,20 +1323,11 @@ def monthly_ranking_dialog(year: int, month: int):
     prefix = f"{year}-{month:02d}-"
     month_df = df[df["날짜"].astype(str).str.startswith(prefix)].copy()
 
-
-
-
     if month_df.empty:
         st.info("해당 월의 시술 데이터가 없습니다.")
         return
 
-
-
-
     st.markdown(f"### {year}년 {month}월")
-
-
-
 
     dept_rank_df = (
         month_df.groupby("시술과")
@@ -1280,14 +1340,8 @@ def monthly_ranking_dialog(year: int, month: int):
     if len(dept_rank_df) > 0:
         dept_rank_df.loc[0, "시술과"] = f"{dept_rank_df.loc[0, '시술과']} 🥇"
 
-
-
-
     st.markdown("#### 시술과별")
     render_rank_table(dept_rank_df[["순위", "시술과", "건수"]])
-
-
-
 
     prof_df = month_df[month_df["교수"].astype(str).str.strip() != ""].copy()
     if prof_df.empty:
@@ -1305,70 +1359,40 @@ def monthly_ranking_dialog(year: int, month: int):
         if len(prof_rank_df) > 0:
             prof_rank_df.loc[0, "교수"] = f"{prof_rank_df.loc[0, '교수']} 🥇"
 
-
-
-
         st.markdown("#### 시술의별")
         render_rank_table(prof_rank_df[["순위", "교수", "건수"]])
 
-
-
-
-
-
-
-
-@st.dialog("시술 직접 입력")
+@st.dialog("직접 입력")
 def add_procedure(selected_date):
     reg_id = st.text_input("등록번호")
     name = st.text_input("이름")
-
-
-
 
     col1, col2 = st.columns(2)
     gender = col1.selectbox("성별", ["M", "F"])
     age = col2.number_input("나이", 0, 120, 60)
 
-
-
-
     ward = st.text_input("병실")
     department_proc = st.selectbox("시술과", ["IR", "NS", "NU"], index=0)
     procedure = st.text_input("시술명")
-
-
-
 
     col3, col4 = st.columns(2)
     dept = col3.text_input("의뢰과")
     doctor = col4.text_input("의뢰의")
 
-
-
-
     emergency_value = st.selectbox("응급", ["N", "🚑"], index=0)
     emergency = (emergency_value == "🚑")
-
-
-
 
     room_options = ["", "1", "2", "H"]
     room = st.selectbox("Room", room_options, index=0)
 
-
-
-
     prof_options = get_prof_select_options(department_proc)
     prof = st.selectbox("시술의", prof_options, index=0)
-
-
-
+    memo = st.text_area("메모", height=100)
 
     if st.button("등록"):
         df = st.session_state["procedures"].copy()
         order = len(df[df["날짜"] == selected_date]) + 1
-
+        
         record = {
             "id": str(uuid.uuid4()),
             "updated_at": now_iso(),
@@ -1397,7 +1421,7 @@ def add_procedure(selected_date):
             "출혈": False,
             "PT_INR": "",
             "PLT": "",
-            "메모": "",
+            "메모": "" if memo is None else str(memo).strip(),
         }
 
         st.session_state["procedures"] = pd.concat([df, pd.DataFrame([record])], ignore_index=True)
@@ -1408,20 +1432,10 @@ def add_procedure(selected_date):
         refresh_procedures()
         st.rerun()
 
-
-
-
-
-
-
-
 @st.dialog("EMR 텍스트 붙여넣기")
 def paste_emr_dialog(selected_date):
     st.write(f"선택 날짜: {selected_date}")
     st.caption("EMR 협진창의 의뢰 정보를 복사해서 아래에 그대로 붙여넣으세요.")
-
-
-
 
     raw_text = st.text_area(
         "EMR 복사 텍스트",
@@ -1429,16 +1443,77 @@ def paste_emr_dialog(selected_date):
         placeholder="EMR에서 복사한 내용을 여기에 붙여넣기"
     )
 
+    # -------------------------
+    # 시술명 선택 UI 추가
+    # -------------------------
+    procedure_options = [
+    "직접입력",
+    "PICC",
+    "PICC change",
+    "Chemoport insertion",
+    "Perm HD insertion",
+    "PTBD",
+    "PTGBD",
+    "Ascites PCD",
+    "Chest PCD, Rt.",
+    "Chest PCD, Lt.",
+    "Chest PCD, Both",
+    "Abscess PCD, liver",
+    "Abscess PCD, abdomen",
+    "PCD removal",
+    "PTGBD removal",
+    "PTGBD tubogram",
+    "PRG",
+    "PCN, Both",
+    "PCN, Rt.",
+    "PCN, Lt.",
+    "TACE",
+    "TAE(Transarterial embolization)",
+    "BAE",
+    "UAE",
+    "PTA, L/E",
+    "PTA, AVF(G)",
+    "IVC filter insertion",
+    "IVC filter removal",
+]
 
+    procedure_choice = st.selectbox(
+        "시술명 선택",
+        procedure_options,
+        index=0,
+        key="emr_procedure_choice"
+    )
 
+    custom_procedure_name = ""
+    if procedure_choice == "직접입력":
+        custom_procedure_name = st.text_input(
+            "직접 입력 시술명",
+            value="",
+            placeholder="시술명을 입력하세요",
+            key="emr_custom_procedure_name"
+        )
+
+    doctor_options = ["정선화", "박상영"]
+    selected_doctor = st.selectbox(
+        "시술의 선택",
+        doctor_options,
+        index=0,
+        key="emr_doctor_choice"
+    )
 
     if st.button("불러오기"):
         if raw_text.strip() == "":
             st.error("붙여넣은 텍스트가 없습니다.")
             return
 
-
-
+        # 최종 시술명 결정
+        if procedure_choice == "직접입력":
+            selected_procedure_name = custom_procedure_name.strip()
+            if selected_procedure_name == "":
+                st.error("직접입력을 선택한 경우 시술명을 입력해야 합니다.")
+                return
+        else:
+            selected_procedure_name = procedure_choice.strip()
 
         try:
             emr_df = parse_emr_text_to_dataframe(raw_text)
@@ -1446,66 +1521,32 @@ def paste_emr_dialog(selected_date):
             st.error(f"텍스트를 읽는 중 오류가 발생했습니다: {e}")
             return
 
-
-
-
         if emr_df.empty:
             st.error("텍스트에서 표 형식을 읽지 못했습니다.")
             return
 
-
-
-
         required_cols = ["등록번호", "환자명", "성별", "나이", "의뢰과", "의뢰의", "입/외", "회신내용"]
         missing_cols = [col for col in required_cols if col not in emr_df.columns]
-
-
-
 
         if missing_cols:
             st.error(f"다음 컬럼이 없습니다: {', '.join(missing_cols)}")
             return
 
-
-
-
         current_df = st.session_state["procedures"].copy()
         current_day_df = current_df[current_df["날짜"] == selected_date]
         next_order = len(current_day_df) + 1
 
-
-
-
         new_rows = []
-
-
-
 
         for _, row in emr_df.iterrows():
             reg_id = "" if pd.isna(row["등록번호"]) else str(row["등록번호"]).strip()
             name = "" if pd.isna(row["환자명"]) else str(row["환자명"]).strip()
 
-
-
-
             if reg_id in ["", "nan", "None"] and name in ["", "nan", "None"]:
                 continue
 
-
-
-
             admission_text = "" if pd.isna(row["입/외"]) else str(row["입/외"]).strip()
-            reply_text = "" if pd.isna(row["회신내용"]) else str(row["회신내용"])
-           
-
-
-
-
             ward = extract_ward_text(admission_text)
-            inferred_procedure = infer_procedure_text(reply_text)
-
-
-
 
             new_rows.append({
                 "id": str(uuid.uuid4()),
@@ -1518,11 +1559,11 @@ def paste_emr_dialog(selected_date):
                 "나이": normalize_age(row["나이"]),
                 "병실": ward,
                 "시술과": "IR",
-                "시술명": inferred_procedure,
+                "시술명": selected_procedure_name,
                 "의뢰과": "" if pd.isna(row["의뢰과"]) else str(row["의뢰과"]).strip(),
                 "의뢰의": "" if pd.isna(row["의뢰의"]) else str(row["의뢰의"]).strip(),
                 "Room": "2",
-                "교수": "",
+                "교수": selected_doctor,
                 "응급": False if str(row.get("응급", "N")).strip().upper() != "Y" else True,
                 "진행상황": STATUS_PLANNED,
                 "동의서": False,
@@ -1538,15 +1579,9 @@ def paste_emr_dialog(selected_date):
             })
             next_order += 1
 
-
-
-
         if len(new_rows) == 0:
             st.warning("가져올 환자 목록이 없습니다.")
             return
-
-
-
 
         new_df = pd.DataFrame(new_rows)
         st.session_state["procedures"] = pd.concat([current_df, new_df], ignore_index=True)
@@ -1561,12 +1596,136 @@ def paste_emr_dialog(selected_date):
         st.success(f"{len(new_rows)}명의 환자 목록을 불러왔습니다.")
         st.rerun()
 
+@st.dialog("EMR-N 텍스트 붙여넣기")
+def paste_emr_n_dialog(selected_date):
+    st.write(f"선택 날짜: {selected_date}")
+    st.caption("EMR-N 목록을 그대로 복사해서 아래에 붙여넣으세요.")
 
+    raw_text = st.text_area(
+        "EMR-N 복사 텍스트",
+        height=300,
+        placeholder="EMR-N에서 복사한 내용을 여기에 붙여넣기",
+        key="emr_n_text_area"
+    )
 
+    emr_n_procedure_options = [
+        "직접입력",
+        "TFCA",
+        "Coil embolization",
+        "Thrombectomy",
+    ]
 
+    procedure_choice = st.selectbox(
+        "시술명 선택",
+        emr_n_procedure_options,
+        index=0,
+        key="emr_n_procedure_choice"
+    )
 
+    custom_procedure_name = ""
+    if procedure_choice == "직접입력":
+        custom_procedure_name = st.text_input(
+            "직접 입력 시술명",
+            value="",
+            placeholder="시술명을 입력하세요",
+            key="emr_n_custom_procedure_name"
+        )
 
+    if st.button("불러오기", key="load_emr_n"):
+        if raw_text.strip() == "":
+            st.error("붙여넣은 텍스트가 없습니다.")
+            return
 
+        if procedure_choice == "직접입력":
+            selected_procedure_name = custom_procedure_name.strip()
+            if selected_procedure_name == "":
+                st.error("직접입력을 선택한 경우 시술명을 입력해야 합니다.")
+                return
+        else:
+            selected_procedure_name = procedure_choice.strip()
+
+        try:
+            emr_df = parse_emr_n_text_to_dataframe(raw_text)
+        except Exception as e:
+            st.error(f"텍스트를 읽는 중 오류가 발생했습니다: {e}")
+            return
+
+        if emr_df.empty:
+            st.error("텍스트에서 표 형식을 읽지 못했습니다.")
+            return
+
+        required_cols = ["등록번호", "환자명", "성별", "나이", "진료과", "시술의", "병동(병실)"]
+        missing_cols = [col for col in required_cols if col not in emr_df.columns]
+
+        if missing_cols:
+            st.error(f"다음 컬럼이 없습니다: {', '.join(missing_cols)}")
+            return
+
+        current_df = st.session_state["procedures"].copy()
+        current_day_df = current_df[current_df["날짜"] == selected_date]
+        next_order = len(current_day_df) + 1
+
+        new_rows = []
+
+        for _, row in emr_df.iterrows():
+            reg_id = "" if pd.isna(row["등록번호"]) else str(row["등록번호"]).strip()
+            name = "" if pd.isna(row["환자명"]) else str(row["환자명"]).strip()
+
+            if reg_id in ["", "nan", "None"] and name in ["", "nan", "None"]:
+                continue
+
+            ward_text = "" if pd.isna(row["병동(병실)"]) else str(row["병동(병실)"]).strip()
+            proc_dept_src = "" if pd.isna(row["진료과"]) else str(row["진료과"]).strip()
+            proc_dept = map_emr_n_proc_dept(proc_dept_src)
+
+            new_rows.append({
+                "id": str(uuid.uuid4()),
+                "updated_at": now_iso(),
+                "날짜": selected_date,
+                "순서": next_order,
+                "등록번호": reg_id,
+                "이름": name,
+                "성별": normalize_gender(row["성별"]),
+                "나이": normalize_age(row["나이"]),
+                "병실": extract_emr_n_ward_text(ward_text),
+                "시술과": proc_dept,
+                "시술명": selected_procedure_name,
+                "의뢰과": proc_dept_src,
+                "의뢰의": "" if pd.isna(row.get("진료의", "")) else str(row.get("진료의", "")).strip(),
+                "Room": "1",
+                "교수": "" if pd.isna(row["시술의"]) else str(row["시술의"]).strip(),
+                "응급": False,
+                "진행상황": STATUS_PLANNED,
+                "동의서": False,
+                "감염": False,
+                "감염메모": "",
+                "ADR": False,
+                "ADR메모": "",
+                "신기능": False,
+                "Cr": "",
+                "출혈": False,
+                "PT_INR": "",
+                "PLT": "",
+                "메모": ""
+            })
+            next_order += 1
+
+        if len(new_rows) == 0:
+            st.warning("가져올 환자 목록이 없습니다.")
+            return
+
+        new_df = pd.DataFrame(new_rows)
+        st.session_state["procedures"] = pd.concat([current_df, new_df], ignore_index=True)
+
+        if sheet_enabled():
+            for record in new_rows:
+                append_procedure_record(record)
+        else:
+            save_data(st.session_state["procedures"])
+
+        refresh_procedures()
+        st.success(f"{len(new_rows)}명의 환자 목록을 불러왔습니다.")
+        st.rerun()
 
 def move_up(row_id):
     df = st.session_state["procedures"].copy()
@@ -1605,7 +1764,6 @@ def move_up(row_id):
     else:
         save_data(df)
 
-
 def move_down(row_id):
     df = st.session_state["procedures"].copy()
     idx = get_df_index_by_id(df, row_id)
@@ -1643,7 +1801,6 @@ def move_down(row_id):
     else:
         save_data(df)
 
-
 st.markdown("""
 
 <style>
@@ -1679,16 +1836,10 @@ input:disabled, textarea:disabled {
     margin: 0 !important;
 }
 
-
-
-
 [class*="st-key-cal_"] button:hover {
     background-color: #f5f5f5;
     border: 3px solid #e6e6e6;
 }
-
-
-
 
 [class*="st-key-cal_today"] button {
     background-color: #fff7cc !important;
@@ -1698,47 +1849,29 @@ input:disabled, textarea:disabled {
     background-color: #fff2a8 !important;
 }
 
-
-
-
 .nowrap-header {
     white-space: nowrap;
     word-break: keep-all;
     overflow-wrap: normal;
     font-weight: 700;
-    font-size: 1.2rem;
+    font-size: 0.9rem;
 }
-
-
-
 
 [class*="st-key-cal_sat_"] button {
     color: #2563eb !important;
 }
 
-
-
-
 [class*="st-key-cal_sun_"] button {
     color: #dc2626 !important;
 }
-
-
-
 
 [class*="st-key-cal_today_sat_"] button {
     color: #2563eb !important;
 }
 
-
-
-
 [class*="st-key-cal_today_sun_"] button {
     color: #dc2626 !important;
 }
-
-
-
 
 button[kind="primary"][data-testid="baseButton-secondary"],
 button[kind="secondary"][data-testid="baseButton-secondary"] {
@@ -1760,7 +1893,6 @@ button[kind="secondary"][data-testid="baseButton-secondary"] {
     background: transparent !important;
 }
 
-
 [class*="st-key-precheck_"] button,
 [class*="st-key-infection_"] button {
     min-height: 1.45rem !important;
@@ -1770,9 +1902,6 @@ button[kind="secondary"][data-testid="baseButton-secondary"] {
     line-height: 1.1 !important;
     border-radius: 0.8rem !important;
 }
-
-
-
 
 [class*="st-key-precheck_infect_btn_"] button[kind="primary"],
 [class*="st-key-infection_save_"] button[kind="primary"] {
@@ -1786,17 +1915,11 @@ button[kind="secondary"][data-testid="baseButton-secondary"] {
     color: white !important;
 }
 
-
-
-
 [class*="st-key-precheck_infect_btn_"] button[kind="primary"] {
     background-color: #8b5e3c !important;
     border: 1px solid #8b5e3c !important;
     color: white !important;
 }
-
-
-
 
 [class*="st-key-precheck_adr_btn_"] button[kind="primary"] {
     background-color: #f59e0b !important;
@@ -1804,17 +1927,11 @@ button[kind="secondary"][data-testid="baseButton-secondary"] {
     color: white !important;
 }
 
-
-
-
 [class*="st-key-precheck_renal_btn_"] button[kind="primary"] {
     background-color: #8b5cf6 !important;
     border: 1px solid #8b5cf6 !important;
     color: white !important;
 }
-
-
-
 
 [class*="st-key-precheck_bleeding_btn_"] button[kind="primary"] {
     background-color: #fca5a5 !important;
@@ -1847,18 +1964,12 @@ button[kind="secondary"][data-testid="baseButton-secondary"] {
 </style>
 """, unsafe_allow_html=True)
 
-
-
-
 query = st.query_params
 selected_date = query.get("date")
 duty_month = query.get("duty")
 board_date = query.get("board")
 history_reg = query.get("history")
 history_back_date = query.get("history_date")
-
-
-
 
 # -------------------------
 # 당직 페이지
@@ -1925,75 +2036,59 @@ if duty_month:
 
     st.stop()
 
-
-
 # -------------------------
 # 현황판 페이지
 # -------------------------
+from streamlit_autorefresh import st_autorefresh
+
 if board_date:
+    refresh_count = st_autorefresh(interval=30000, key=f"board_autorefresh_{board_date}")
+
+    if "procedures" not in st.session_state or refresh_count > 0:
+        st.session_state["procedures"] = load_data()
+
     top_back, top_refresh, top_space = st.columns([1.4, 1.4, 7.2])
 
     with top_back:
         if st.button("⬅ 시술목록", use_container_width=True, key=f"back_from_board_{board_date}"):
-            st.query_params.clear()
-            st.query_params["date"] = board_date
+            replace_query_params(date=board_date)
             st.rerun()
 
     with top_refresh:
         if st.button("🔄 새로고침", use_container_width=True, key=f"refresh_board_{board_date}"):
+            st.session_state["procedures"] = load_data()
             st.rerun()
 
     df = st.session_state["procedures"].copy()
     day_df = df[df["날짜"] == board_date].copy()
 
-
-
-
     total_count = len(day_df)
     done_count = len(day_df[day_df["진행상황"] == STATUS_DONE])
     progress_pct = int((done_count / total_count) * 100) if total_count > 0 else 0
 
-
-
-
     board_dt = datetime.strptime(board_date, "%Y-%m-%d")
     weekday_kr = ["월", "화", "수", "목", "금", "토", "일"][board_dt.weekday()]
     board_date_text = f"{board_date} ({weekday_kr})"
-
-
-
 
     room2_in_df = day_df[
         (day_df["Room"].astype(str) == "2") &
         (day_df["진행상황"] == STATUS_INROOM)
     ].copy().sort_values("순서")
 
-
-
-
     room1_in_df = day_df[
         (day_df["Room"].astype(str) == "1") &
         (day_df["진행상황"] == STATUS_INROOM)
     ].copy().sort_values("순서")
-
-
-
 
     room2_call_df = day_df[
         (day_df["Room"].astype(str) == "2") &
         (day_df["진행상황"] == STATUS_CALLED)
     ].copy().sort_values("순서")
 
-
-
-
     room1_call_df = day_df[
         (day_df["Room"].astype(str) == "1") &
         (day_df["진행상황"] == STATUS_CALLED)
     ].copy().sort_values("순서")
-
-
-
 
     def patient_text(r):
         reg = "" if pd.isna(r["등록번호"]) else str(r["등록번호"])
@@ -2001,33 +2096,18 @@ if board_date:
         proc = "" if pd.isna(r["시술명"]) else str(r["시술명"])
         return f"{reg} {name}<br/>{proc}"
 
-
-
-
     room2_in_text = "<br/><br/>".join(
         patient_text(r) for _, r in room2_in_df.iterrows()
     ) if not room2_in_df.empty else "-"
-
-
-
 
     room1_in_text = "<br/><br/>".join(
         patient_text(r) for _, r in room1_in_df.iterrows()
     ) if not room1_in_df.empty else "-"
 
-
-
-
     room2_call_rows = [patient_text(r) for _, r in room2_call_df.iterrows()]
     room1_call_rows = [patient_text(r) for _, r in room1_call_df.iterrows()]
 
-
-
-
     max_call_len = max(len(room2_call_rows), len(room1_call_rows), 1)
-
-
-
 
     call_rows_html = ""
     for idx in range(max_call_len):
@@ -2036,9 +2116,6 @@ if board_date:
         label_text = "호출/도착" if idx == 0 else "&nbsp;"
         label_class = "section-label" if idx == 0 else "blank-label"
 
-
-
-
         call_rows_html += f"""
         <tr>
             <td class="{label_class}">{label_text}</td>
@@ -2046,9 +2123,6 @@ if board_date:
             <td class="patient-cell">{room1_val}</td>
         </tr>
         """
-
-
-
 
     board_html = f"""
 <!DOCTYPE html>
@@ -2063,18 +2137,12 @@ if board_date:
             color: #111827;
         }}
 
-
-
-
         .wrapper {{
             padding: 10px 12px 20px 12px;
             position: relative;
             min-height: 860px;
             box-sizing: border-box;
         }}
-
-
-
 
         .title {{
             font-size: 36px;
@@ -2083,9 +2151,6 @@ if board_date:
             margin-bottom: 10px;
         }}
 
-
-
-
         .topbar {{
             display: grid;
             grid-template-columns: 1fr 1fr;
@@ -2093,17 +2158,11 @@ if board_date:
             margin-bottom: 18px;
         }}
 
-
-
-
         .progress {{
             font-size: 24px;
             font-weight: 800;
             text-align: left;
         }}
-
-
-
 
         .datetime-wrap {{
             display: flex;
@@ -2112,17 +2171,11 @@ if board_date:
             gap: 14px;
         }}
 
-
-
-
         .board-date {{
             font-size: 34px;
             font-weight: 800;
             white-space: nowrap;
         }}
-
-
-
 
         .clock {{
             font-size: 30px;
@@ -2132,17 +2185,11 @@ if board_date:
             white-space: nowrap;
         }}
 
-
-
-
         table {{
             width: 100%;
             border-collapse: collapse;
             table-layout: fixed;
         }}
-
-
-
 
         th, td {{
             border: 2px solid #cbd5e1;
@@ -2151,17 +2198,11 @@ if board_date:
             vertical-align: middle;
         }}
 
-
-
-
         th {{
             background: #cbd5e1;
             font-size: 28px;
             font-weight: 800;
         }}
-
-
-
 
         .section-label {{
             background: #e5eef9;
@@ -2171,17 +2212,11 @@ if board_date:
             width: 20%;
         }}
 
-
-
-
         .blank-label {{
             background: white;
             color: white;
             width: 20%;
         }}
-
-
-
 
         .patient-cell {{
             background: #f8fafc;
@@ -2191,9 +2226,6 @@ if board_date:
             word-break: keep-all;
             white-space: normal;
         }}
-
-
-
 
         .spacer-row td {{
             height: 50px;
@@ -2205,22 +2237,11 @@ if board_date:
             border-bottom: 0;
         }}
 
-
-
-
-
-
-
-
-
     </style>
 </head>
 <body>
     <div class="wrapper">
         <div class="title">실시간 시술현황</div>
-
-
-
 
         <div class="topbar">
             <div class="progress">진행도: {done_count}/{total_count} ({progress_pct}%)</div>
@@ -2229,9 +2250,6 @@ if board_date:
                 <div class="clock" id="clock">--:--:--</div>
             </div>
         </div>
-
-
-
 
         <table>
             <colgroup>
@@ -2245,17 +2263,11 @@ if board_date:
                 <th>1번방 (Bi plane)</th>
             </tr>
 
-
-
-
             <tr>
                 <td class="section-label">입실/시술중</td>
                 <td class="patient-cell">{room2_in_text}</td>
                 <td class="patient-cell">{room1_in_text}</td>
             </tr>
-
-
-
 
             <tr class="spacer-row">
                 <td>&nbsp;</td>
@@ -2263,14 +2275,9 @@ if board_date:
                 <td>&nbsp;</td>
             </tr>
 
-
-
-
             {call_rows_html}
         </table>
     </div>
-
-
 
     <script>
         function updateClock() {{
@@ -2287,12 +2294,8 @@ if board_date:
 </html>
 """
 
-
-
-
     components.html(board_html, height=900, scrolling=True)
     st.stop()
-
 # -------------------------
 # 환자 history 페이지
 # -------------------------
@@ -2308,10 +2311,8 @@ if history_reg:
         if st.button("⬅ 뒤로가기"):
             if history_back_date:
                 st.query_params["date"] = history_back_date
-            if "history" in st.query_params:
-                del st.query_params["history"]
-            if "history_date" in st.query_params:
-                del st.query_params["history_date"]
+            clear_query_param("history")
+            clear_query_param("history_date")
             st.rerun()
 
         st.stop()
@@ -2325,9 +2326,7 @@ if history_reg:
     top1, top2 = st.columns([1.2, 8.8])
     with top1:
         if st.button("⬅ 뒤로가기", use_container_width=True):
-            st.query_params.clear()
-            if history_back_date:
-                st.query_params["date"] = history_back_date
+            replace_query_params(date=history_back_date if history_back_date else None)
             st.rerun()
 
     st.title("환자 시술 History")
@@ -2376,22 +2375,14 @@ if history_reg:
 
     st.stop()
 
-
-
 # -------------------------
 # 시술 목록 페이지
 # -------------------------
 if selected_date and not history_reg:
     st.title(f"📅 {selected_date} 시술 목록")
 
-
-
-
     df = st.session_state["procedures"]
     day_all_df = df[df["날짜"] == selected_date].copy()
-
-
-
 
     total_count = len(day_all_df)
     inroom_count = len(day_all_df[day_all_df["진행상황"] == STATUS_INROOM])
@@ -2399,73 +2390,55 @@ if selected_date and not history_reg:
     planned_count = len(day_all_df[day_all_df["진행상황"] == STATUS_PLANNED])
     done_count = len(day_all_df[day_all_df["진행상황"] == STATUS_DONE])
 
-
-
-
-    top_left, top_board, top_spacer, top_btn1, top_btn2, top_btn3 = st.columns([10.0, 1.3, 0.5, 1.5, 1.5, 1.3])
-
-
-
+    top_left, top_board, top_spacer, top_btn1, top_btn2, top_btn2n, top_btn3 = st.columns(
+    [6.0, 1.5, 0.2, 1.8, 1.5, 1.6, 2.0])
 
     with top_left:
         if st.button("⬅ 캘린더로 돌아가기", use_container_width=False):
-            if "date" in st.query_params:
-                del st.query_params["date"]
-            if "board" in st.query_params:
-                del st.query_params["board"]
-            if "duty" in st.query_params:
-                del st.query_params["duty"]
+            clear_query_param("date")
+            clear_query_param("board")
+            clear_query_param("duty")
             st.rerun()
-
-
-
 
     with top_board:
-        if st.button("📺 현황판", key=f"go_board_{selected_date}", use_container_width=True):
-            st.query_params.clear()
-            st.query_params["board"] = selected_date
-            st.rerun()
-
-
-
+        board_url = app_query_string(board=selected_date)
+        st.markdown(
+            f"""
+            <a href="{board_url}" target="_blank" style="text-decoration:none;">
+                <div style="display:flex; align-items:center; justify-content:center; width:100%; min-height:2.5rem; padding:0.25rem 0.75rem; border:1px solid rgba(49, 51, 63, 0.2); border-radius:0.5rem; background:#ffffff; color:#111827; font-weight:600; cursor:pointer;">📺 현황판</div>
+            </a>
+            """,
+            unsafe_allow_html=True,
+        )
 
     with top_btn1:
-        if st.button("➕ 시술 직접 입력", use_container_width=False):
+        if st.button("➕ 직접 입력", use_container_width=False):
             add_procedure(selected_date)
 
-
-
-
     with top_btn2:
-        if st.button("📋 EMR 붙여넣기", use_container_width=False):
+        if st.button("📋 EMR-IR", use_container_width=False):
             paste_emr_dialog(selected_date)
 
-
-
+    with top_btn2n:
+        if st.button("📋 EMR-N", use_container_width=False):
+            paste_emr_n_dialog(selected_date)
 
     with top_btn3:
-        if st.button("🔄 새로고침", use_container_width=False):
+        if st.button("🔄 새로고침"):
+            st.session_state["procedures"] = load_data()
+            st.session_state["vacation_notes"] = load_vacation_data()
             st.rerun()
 
-
-
-
     row2_left, row2_right = st.columns([1.4, 8.0])
-
-
-
 
     with row2_left:
         if st.button("🏅 Ranking", use_container_width=False):
             ranking_dialog(selected_date)
 
-
-
-
     with row2_right:
         st.markdown(
             f"""
-            <div style="padding-top: 0.15rem; font-size: 26pt; font-weight: 700; line-height: 1.3;">
+            <div style="padding-top: 0.15rem; font-size: 2.0rem; font-weight: 700; line-height: 1.3;">
                 <span style="color: #000000;">Total {total_count}</span>
                 <span style="color: #000000;"> = </span>
                 <span style="color: {STATUS_COLORS[STATUS_INROOM]};">입실</span>
@@ -2485,11 +2458,8 @@ if selected_date and not history_reg:
         )
     st.markdown("---")
 
-
-
-
-    col_widths = [0.35, 1.90, 0.75, 0.80, 2.20, 0.80, 0.90, 2.50, 1.45, 0.70, 0.40, 0.40, 0.40]
-    h0, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12 = st.columns(col_widths)
+    col_widths = [0.35, 1.85, 1.00, 0.70, 2.10, 0.50, 0.80, 2.70, 1.35, 0.45, 0.60, 0.35, 0.35, 0.40]
+    h0, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13 = st.columns(col_widths)
     h0.markdown('<div class="nowrap-header"> </div>', unsafe_allow_html=True)
     h1.markdown('<div class="nowrap-header">등록번호/이름/병실</div>', unsafe_allow_html=True)
     h2.markdown('<div class="nowrap-header">시술전확인</div>', unsafe_allow_html=True)
@@ -2500,21 +2470,14 @@ if selected_date and not history_reg:
     h7.markdown('<div class="nowrap-header">진행상황</div>', unsafe_allow_html=True)
     h8.markdown('<div class="nowrap-header">의뢰과/의뢰의</div>', unsafe_allow_html=True)
     h9.markdown('<div class="nowrap-header">응급</div>', unsafe_allow_html=True)
-    h10.markdown('<div class="nowrap-header">↑</div>', unsafe_allow_html=True)
-    h11.markdown('<div class="nowrap-header">↓</div>', unsafe_allow_html=True)
-    h12.markdown('<div class="nowrap-header">삭제</div>', unsafe_allow_html=True)
-
-
+    h10.markdown('<div class="nowrap-header">수정</div>', unsafe_allow_html=True)
+    h11.markdown('<div class="nowrap-header">↑</div>', unsafe_allow_html=True)
+    h12.markdown('<div class="nowrap-header">↓</div>', unsafe_allow_html=True)
+    h13.markdown('<div class="nowrap-header">삭제</div>', unsafe_allow_html=True)
 
     st.markdown("---")
 
-
-
-
     day_df = get_display_day_df(df, selected_date)
-
-
-
 
     if len(day_df) == 0:
         st.info("등록된 시술 없음")
@@ -2523,14 +2486,8 @@ if selected_date and not history_reg:
             row_id = row["id"]
             is_done = row["진행상황"] == STATUS_DONE
 
-
-
-
             is_done = row["진행상황"] == STATUS_DONE
             is_inroom = row["진행상황"] == STATUS_INROOM
-
-
-
 
             if is_done:
                 row_key = f"row_done_{row_id}"
@@ -2539,64 +2496,40 @@ if selected_date and not history_reg:
             else:
                 row_key = f"row_{row_id}"
 
-
-
-
             with st.container(key=row_key):
-                    col0, col1, col2, col3, col4, col5, col6, col7, col8, col9, col10, col11, col12 = st.columns(col_widths)
+                col0, col1, col2, col3, col4, col5, col6, col7, col8, col9, col10, col11, col12, col13 = st.columns(col_widths)
 
-                    reg_no = "" if pd.isna(row["등록번호"]) else str(row["등록번호"]).strip()
+                reg_no = "" if pd.isna(row["등록번호"]) else str(row["등록번호"]).strip()
 
-                    if reg_no:
-                        if col0.button("🔍", key=f"history_btn_{selected_date}_{reg_no}_{i}"):
-                            st.query_params.clear()
-                            st.query_params["date"] = selected_date
-                            st.query_params["history"] = reg_no
-                            st.query_params["history_date"] = selected_date
-                            st.rerun()
-                    else:
-                        col0.write("")
+                if reg_no:
+                    if col0.button("🔍", key=f"history_btn_{selected_date}_{reg_no}_{i}"):
+                        replace_query_params(date=selected_date, history=reg_no, history_date=selected_date)
+                        st.rerun()
+                else:
+                    col0.write("")
 
-                    patient_info = f"{row['등록번호']} | {row['이름']} ({row['성별']}/{row['나이']}) | {row['병실']}"
-                    col1.write(patient_info)
-
-
-
+                patient_info = f"{row['등록번호']} | {row['이름']} ({row['성별']}/{row['나이']}) | {row['병실']}"
+                col1.write(patient_info)
 
             with col2:
                 consent_on = bool(row["동의서"]) if "동의서" in row else False
 
-
-
-
                 infection_on = bool(row["감염"]) if "감염" in row else False
                 infection_memo = "" if pd.isna(row.get("감염메모", "")) else str(row.get("감염메모", "")).strip()
-
-
-
 
                 adr_on = bool(row["ADR"]) if "ADR" in row else False
                 adr_memo = "" if pd.isna(row.get("ADR메모", "")) else str(row.get("ADR메모", "")).strip()
 
-
-
-
                 renal_on = bool(row["신기능"]) if "신기능" in row else False
                 cr_value = "" if pd.isna(row.get("Cr", "")) else str(row.get("Cr", "")).strip()
-
-
-
 
                 bleeding_on = bool(row["출혈"]) if "출혈" in row else False
                 pt_inr_value = "" if pd.isna(row.get("PT_INR", "")) else str(row.get("PT_INR", "")).strip()
                 plt_value = "" if pd.isna(row.get("PLT", "")) else str(row.get("PLT", "")).strip()
 
-
-
-
                 consent_btn_type = "primary" if consent_on else "secondary"
                 if st.button(
-                    "동의서(+)",
+                    "동의(+)",
                     key=f"precheck_consent_{i}",
                     use_container_width=True,
                     type=consent_btn_type
@@ -2604,11 +2537,8 @@ if selected_date and not history_reg:
                     toggle_consent(row_id)
                     st.rerun()
 
-
-
-
                 infect_btn_type = "primary" if infection_on else "secondary"
-                infect_c1, infect_c2 = st.columns([1.7, 1.0])
+                infect_c1, infect_c2 = st.columns([2.0, 1.0])
                 with infect_c1:
                     if st.button(
                         "감염",
@@ -2619,18 +2549,12 @@ if selected_date and not history_reg:
                         st.session_state[f"infect_pop_open_{i}"] = not st.session_state.get(f"infect_pop_open_{i}", False)
                         st.rerun()
 
-
-
-
                 with infect_c2:
                     if infection_on and infection_memo:
                         st.markdown(
                             f"<div style='font-size:0.82rem; padding-top:0.28rem; color:#444; white-space:nowrap;'>{infection_memo}</div>",
                             unsafe_allow_html=True
                         )        
-
-
-
 
                 if st.session_state.get(f"infect_pop_open_{i}", False):
                     infection_input = st.text_input(
@@ -2640,16 +2564,10 @@ if selected_date and not history_reg:
                         label_visibility="collapsed",
                     )
 
-
-
-
                     if st.button("확인", key=f"infection_save_{i}", use_container_width=True):
                         save_infection_info(row_id, st.session_state.get(f"infection_text_{i}", ""))
                         st.session_state[f"infect_pop_open_{i}"] = False
                         st.rerun()
-
-
-
 
                 adr_btn_type = "primary" if adr_on else "secondary"
                 if st.button(
@@ -2662,9 +2580,6 @@ if selected_date and not history_reg:
                     st.session_state[f"adr_pop_open_{i}"] = not st.session_state.get(f"adr_pop_open_{i}", False)
                     st.rerun()
 
-
-
-
                 if st.session_state.get(f"adr_pop_open_{i}", False):
                     adr_input = st.text_input(
                         "ADR내용",
@@ -2673,16 +2588,10 @@ if selected_date and not history_reg:
                         label_visibility="collapsed",
                     )
 
-
-
-
                     if st.button("확인", key=f"adr_save_{i}", use_container_width=True):
                         save_adr_info(row_id, st.session_state.get(f"adr_text_{i}", ""))
                         st.session_state[f"adr_pop_open_{i}"] = False
                         st.rerun()
-
-
-
 
                 renal_btn_type = "primary" if renal_on else "secondary"
                 if st.button(
@@ -2695,9 +2604,6 @@ if selected_date and not history_reg:
                     st.session_state[f"renal_pop_open_{i}"] = not st.session_state.get(f"renal_pop_open_{i}", False)
                     st.rerun()
 
-
-
-
                 if st.session_state.get(f"renal_pop_open_{i}", False):
                     r_label, r_input = st.columns([1, 2])
                     r_label.markdown("<div style='padding-top:0.42rem; font-weight:600;'>Cr</div>", unsafe_allow_html=True)
@@ -2708,23 +2614,14 @@ if selected_date and not history_reg:
                         label_visibility="collapsed",
                     )
 
-
-
-
                     if st.button("확인", key=f"renal_save_{i}", use_container_width=True):
                         save_renal_info(row_id, st.session_state.get(f"renal_cr_text_{i}", ""))
                         st.session_state[f"renal_pop_open_{i}"] = False
                         st.rerun()
 
-
-
-
                 bleeding_help = None
                 if pt_inr_value or plt_value:
                     bleeding_help = f"PT INR: {pt_inr_value} / Plt: {plt_value}"
-
-
-
 
                 bleeding_btn_type = "primary" if bleeding_on else "secondary"
                 if st.button(
@@ -2737,9 +2634,6 @@ if selected_date and not history_reg:
                     st.session_state[f"bleeding_pop_open_{i}"] = not st.session_state.get(f"bleeding_pop_open_{i}", False)
                     st.rerun()
 
-
-
-
                 if st.session_state.get(f"bleeding_pop_open_{i}", False):
                     b1, b2 = st.columns([1.2, 1.8])
                     b1.markdown("<div style='padding-top:0.42rem; font-weight:600;'>PT INR</div>", unsafe_allow_html=True)
@@ -2750,9 +2644,6 @@ if selected_date and not history_reg:
                         label_visibility="collapsed",
                     )
 
-
-
-
                     b3, b4 = st.columns([1.2, 1.8])
                     b3.markdown("<div style='padding-top:0.42rem; font-weight:600;'>Plt</div>", unsafe_allow_html=True)
                     b4.text_input(
@@ -2761,9 +2652,6 @@ if selected_date and not history_reg:
                         key=f"bleeding_plt_text_{i}",
                         label_visibility="collapsed",
                     )
-
-
-
 
                     if st.button("확인", key=f"bleeding_save_{i}", use_container_width=True):
                         save_bleeding_info(
@@ -2774,122 +2662,27 @@ if selected_date and not history_reg:
                         st.session_state[f"bleeding_pop_open_{i}"] = False
                         st.rerun()
 
-
-
-
-            proc_dept_options = ["IR", "NS", "NU"]
-            proc_dept_value = row["시술과"] if row["시술과"] in proc_dept_options else "IR"
-
-
-
-
+            proc_dept_value = row["시술과"] if row["시술과"] in ["IR", "NS", "NU"] else "IR"
             memo_value = "" if pd.isna(row.get("메모", "")) else str(row.get("메모", ""))
 
-
-
-
-            if is_done:
-                 col3.write(proc_dept_value)
-
-
-
-
-                 col4.write("" if pd.isna(row["시술명"]) else str(row["시술명"]))
-                 col4.text_area(
-                    "메모",
-                    value=memo_value,
-                    key=f"memo_done_{i}",
-                    height=80,
-                    disabled=True,
-                    label_visibility="collapsed"
-                 )
-
-
-
-
-                 col5.write("" if pd.isna(row["Room"]) else str(row["Room"]))
-                 col6.write("" if pd.isna(row["교수"]) else str(row["교수"]))
+            col3.write(proc_dept_value)
+            procedure_text = "" if pd.isna(row["시술명"]) else str(row["시술명"])
+            if memo_value.strip():
+                col4.markdown(
+                    f"<div>{procedure_text}</div><div style='font-size:0.9rem; color:#555; padding-top:0.22rem; white-space:pre-wrap;'>{memo_value}</div>",
+                    unsafe_allow_html=True,
+                )
             else:
-                proc_dept = col3.selectbox(
-                     "시술과",
-                     proc_dept_options,
-                     index=proc_dept_options.index(proc_dept_value),
-                     key=f"procdept_{i}",
-                    label_visibility="collapsed"
-                )
+                col4.write(procedure_text)
 
 
-
-
-                procedure_value = col4.text_input(
-                    "시술명",
-                    value="" if pd.isna(row["시술명"]) else str(row["시술명"]),
-                    key=f"procedure_{i}",
-                    label_visibility="collapsed",
-                    placeholder="시술명 입력"
-                )
-
-
-
-
-                memo_value = col4.text_area(
-                    "메모",
-                    value=memo_value,
-                    key=f"memo_{i}",
-                    height=80,
-                    label_visibility="collapsed",
-                    placeholder="추가 메모 입력"
-                )
-
-
-
-
-                room_options = ["", "1", "2", "H"]
-                room_value = row["Room"] if row["Room"] in room_options else ""
-                room = col5.selectbox(
-                    "Room",
-                    room_options,
-                    index=room_options.index(room_value),
-                    key=f"room_{i}",
-                    label_visibility="collapsed"
-                )
-
-
-
-
-                prof_options = get_prof_select_options(proc_dept)
-                current_prof_value = row["교수"] if row["교수"] in prof_options else ""
-                prof_index = prof_options.index(current_prof_value)
-
-
-
-
-                prof = col6.selectbox(
-                    "시술의",
-                    prof_options,
-                    index=prof_index,
-                    key=f"prof_{i}",
-                    label_visibility="collapsed"
-                )
-
-
-
-
-                update_inline_row(row_id, proc_dept, procedure_value, room, prof, memo_value)
-
-
-
+            col5.write("" if pd.isna(row["Room"]) else str(row["Room"]))
+            col6.write("" if pd.isna(row["교수"]) else str(row["교수"]))
 
             current_status = row["진행상황"] if row["진행상황"] in VALID_STATUSES else STATUS_PLANNED
 
-
-
-
             with col7:
                 s1, s2, s3, s4 = st.columns(4)
-
-
-
 
                 if current_status == STATUS_PLANNED:
                     with s1:
@@ -2899,9 +2692,6 @@ if selected_date and not history_reg:
                         set_status(row_id, STATUS_PLANNED)
                         st.rerun()
 
-
-
-
                 if current_status == STATUS_CALLED:
                     with s2:
                         status_badge("호출", STATUS_CALLED)
@@ -2909,9 +2699,6 @@ if selected_date and not history_reg:
                     if s2.button("호출", key=f"status_call_{i}", use_container_width=True):
                         set_status(row_id, STATUS_CALLED)
                         st.rerun()
-
-
-
 
                 if current_status == STATUS_INROOM:
                     with s3:
@@ -2921,9 +2708,6 @@ if selected_date and not history_reg:
                         set_status(row_id, STATUS_INROOM)
                         st.rerun()
 
-
-
-
                 if current_status == STATUS_DONE:
                     with s4:
                         status_badge("완료", STATUS_DONE)
@@ -2932,68 +2716,28 @@ if selected_date and not history_reg:
                         set_status(row_id, STATUS_DONE)
                         st.rerun()
 
-
-
-
             col8.write(f"{row['의뢰과']} / {row['의뢰의']}")
 
-
-
-
             current_emergency = "🚑" if bool(row["응급"]) else "N"
+            col9.write(current_emergency)
 
+            if col10.button("수정", key=f"edit_{i}", use_container_width=True):
+                edit_procedure_dialog(row_id)
 
-
-
-            if is_done:
-                col9.write(current_emergency)
-            else:
-                selected_emergency = col9.selectbox(
-                    "응급",
-                    ["N", "🚑"],
-                    index=0 if current_emergency == "N" else 1,
-                    key=f"emergency_{i}",
-                    label_visibility="collapsed"
-                )
-
-
-
-
-                if selected_emergency != current_emergency:
-                    set_emergency(row_id, selected_emergency)
-                    st.rerun()
-
-
-
-
-            if col10.button("↑", key=f"up_{i}"):
+            if col11.button("↑", key=f"up_{i}"):
                 move_up(row_id)
                 st.rerun()
 
-
-
-
-            if col11.button("↓", key=f"down_{i}"):
+            if col12.button("↓", key=f"down_{i}"):
                 move_down(row_id)
                 st.rerun()
 
-
-
-
-            if col12.button("🗑", key=f"del_{i}"):
+            if col13.button("🗑", key=f"del_{i}"):
                 delete_dialog(row_id)
-
-
-
 
             st.markdown("<hr style='margin:4px 0;'>", unsafe_allow_html=True)
 
-
-
-
     st.stop()
-
-
 
 # -------------------------
 # 메인 캘린더 페이지
@@ -3007,43 +2751,27 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-
-
-
 top_btn_row_left, top_btn_row_mid, top_btn_row_rest = st.columns([1.2, 1.2, 7.6])
-
-
-
 
 with top_btn_row_left:
     if st.button("🏅 Ranking", use_container_width=True):
         monthly_ranking_dialog(st.session_state["calendar_year"], st.session_state["calendar_month"])
 
-
-
-
 with top_btn_row_mid:
     if st.button("📅 당직", use_container_width=True):
-        st.query_params["duty"] = f"{st.session_state['calendar_year']}-{st.session_state['calendar_month']:02d}"
+        replace_query_params(duty=f"{st.session_state['calendar_year']}-{st.session_state['calendar_month']:02d}")
         st.rerun()
-
-
-
 
 year = st.session_state["calendar_year"]
 month = st.session_state["calendar_month"]
 df = st.session_state["procedures"]
 
-
 month_total = get_month_case_total(df, year, month)
-
 
 nav1, nav2, nav3 = st.columns([1, 6, 1])
 
-
 with nav1:
     st.button("◀", on_click=prev_month, use_container_width=True)
-
 
 with nav2:
     st.markdown(
@@ -3060,27 +2788,16 @@ with nav2:
         unsafe_allow_html=True
     )
 
-
 with nav3:
     st.button("▶", on_click=next_month, use_container_width=True)
-
 
 year = st.session_state["calendar_year"]
 month = st.session_state["calendar_month"]
 
-
-
-
 calendar.setfirstweekday(calendar.SUNDAY)
 cal = calendar.monthcalendar(year, month)
 
-
-
-
 weekdays = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
-
-
-
 
 cols = st.columns(7)
 for i, day_name in enumerate(weekdays):
@@ -3090,26 +2807,14 @@ for i, day_name in enumerate(weekdays):
     elif day_name == "Sat":
         color = "#2563eb"
 
-
-
-
     cols[i].markdown(
-        f"<div style='text-align:center; font-size:16pt; font-weight:700; color:{color};'>{day_name}</div>",
+        f"<div style='text-align:center; font-size:1.5rem; font-weight:700; color:{color};'>{day_name}</div>",
         unsafe_allow_html=True
     )
 
-
-
-
 df = st.session_state["procedures"]
 
-
-
-
 today = datetime.today().date()
-
-
-
 
 for week in cal:
     cols = st.columns(7)
@@ -3123,7 +2828,6 @@ for week in cal:
         this_date = datetime(year, month, day_num).date()
 
         total_count, ir_count, ns_count, nu_count, neuro_total = get_day_case_summary(df, date_str)
-
 
         memo_text, _ = get_vacation_note(date_str)
 
@@ -3154,7 +2858,7 @@ for week in cal:
 
         with cols[i]:
             if st.button(content, key=cal_key, use_container_width=True):
-                st.query_params["date"] = date_str
+                replace_query_params(date=date_str)
                 st.rerun()
 
             plus_col, note_col = st.columns([1, 5])
