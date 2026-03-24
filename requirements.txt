@@ -1,0 +1,6 @@
+streamlit
+pandas
+gspread
+google-auth
+python-dateutil
+streamlit-autorefresh
