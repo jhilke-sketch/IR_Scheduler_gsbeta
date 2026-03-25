@@ -2384,6 +2384,24 @@ if selected_date and not history_reg:
     df = st.session_state["procedures"]
     day_all_df = df[df["날짜"] == selected_date].copy()
 
+    display_df = day_all_df.copy()
+
+    status_priority_map = {
+        STATUS_INROOM: 0,   # 입실 최상단
+        STATUS_CALLED: 1,   # 그다음 호출
+        STATUS_PLANNED: 2,  # 그다음 예정
+        STATUS_DONE: 3,     # 완료 최하단
+    }
+
+    display_df["status_priority"] = display_df["진행상황"].map(status_priority_map).fillna(99)
+
+    display_df["IR_priority"] = display_df["시술과"].apply(
+        lambda x: 0 if str(x).strip().upper() == "IR" else 1
+    )
+
+    display_df = display_df.sort_values(["status_priority", "IR_priority", "순서"])
+    display_df = display_df.drop(columns=["status_priority", "IR_priority"])
+
     total_count = len(day_all_df)
     inroom_count = len(day_all_df[day_all_df["진행상황"] == STATUS_INROOM])
     called_count = len(day_all_df[day_all_df["진행상황"] == STATUS_CALLED])
@@ -2482,7 +2500,7 @@ if selected_date and not history_reg:
     if len(day_df) == 0:
         st.info("등록된 시술 없음")
     else:
-        for i, row in day_df.iterrows():
+        for i, row in display_df.iterrows():
             row_id = row["id"]
             is_done = row["진행상황"] == STATUS_DONE
 
