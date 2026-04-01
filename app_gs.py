@@ -1149,8 +1149,9 @@ def update_procedure_edit_fields(
     if not changed:
         return
         
-    if "메모" in df.columns:
-        df["메모"] = df["메모"].astype("string")
+    for col, new_value in normalized_updates.items():
+        if col in df.columns:
+            df[col] = df[col].astype(object)
 
     for col, new_value in normalized_updates.items():
         df.at[idx, col] = new_value
