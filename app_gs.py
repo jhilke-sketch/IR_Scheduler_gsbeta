@@ -199,14 +199,16 @@ VACATION_SHEET = "vacation_notes"
 
 STATUS_PLANNED = "예정"
 STATUS_CALLED = "호출"
+STATUS_ARRIVED = "도착"
 STATUS_INROOM = "입실"
 STATUS_DONE = "시술완료"
 
-VALID_STATUSES = [STATUS_PLANNED, STATUS_CALLED, STATUS_INROOM, STATUS_DONE]
+VALID_STATUSES = [STATUS_PLANNED, STATUS_CALLED, STATUS_ARRIVED, STATUS_INROOM, STATUS_DONE]
 
 STATUS_COLORS = {
     STATUS_PLANNED: "#9aa0a6",
     STATUS_CALLED: "#f59e0b",
+    STATUS_ARRIVED: "#f59e0b",   # 색은 호출과 같게 두거나
     STATUS_INROOM: "#ef4444",
     STATUS_DONE: "#38bdf8",
 }
@@ -2086,13 +2088,23 @@ if board_date:
 
     room2_call_df = day_df[
         (day_df["Room"].astype(str) == "2") &
-        (day_df["진행상황"] == STATUS_CALLED)
-    ].copy().sort_values("순서")
+        (day_df["진행상황"].isin([STATUS_CALLED, STATUS_ARRIVED]))
+    ].copy()
+
+    room2_call_df["arrived_priority"] = room2_call_df["진행상황"].apply(
+        lambda x: 0 if x == STATUS_ARRIVED else 1
+    )
+    room2_call_df = room2_call_df.sort_values(["arrived_priority", "순서"]).drop(columns=["arrived_priority"])
 
     room1_call_df = day_df[
         (day_df["Room"].astype(str) == "1") &
-        (day_df["진행상황"] == STATUS_CALLED)
-    ].copy().sort_values("순서")
+        (day_df["진행상황"].isin([STATUS_CALLED, STATUS_ARRIVED]))
+    ].copy()
+
+    room1_call_df["arrived_priority"] = room1_call_df["진행상황"].apply(
+        lambda x: 0 if x == STATUS_ARRIVED else 1
+    )
+    room1_call_df = room1_call_df.sort_values(["arrived_priority", "순서"]).drop(columns=["arrived_priority"])
 
     def patient_text(r):
         reg = "" if pd.isna(r["등록번호"]) else str(r["등록번호"])
@@ -2392,9 +2404,10 @@ if selected_date and not history_reg:
 
     status_priority_map = {
         STATUS_INROOM: 0,   # 입실 최상단
-        STATUS_CALLED: 1,   # 그다음 호출
-        STATUS_PLANNED: 2,  # 그다음 예정
-        STATUS_DONE: 3,     # 완료 최하단
+        STATUS_ARRIVED: 1,  # 그다음 도착
+        STATUS_CALLED: 2,   # 그다음 호출
+        STATUS_PLANNED: 3,  # 그다음 예정
+        STATUS_DONE: 4,     # 완료 최하단
     }
 
     display_df["status_priority"] = display_df["진행상황"].map(status_priority_map).fillna(99)
@@ -2704,7 +2717,7 @@ if selected_date and not history_reg:
             current_status = row["진행상황"] if row["진행상황"] in VALID_STATUSES else STATUS_PLANNED
 
             with col7:
-                s1, s2, s3, s4 = st.columns(4)
+                s1, s2, s3, s4, s5 = st.columns(5)
 
                 if current_status == STATUS_PLANNED:
                     with s1:
@@ -2722,19 +2735,27 @@ if selected_date and not history_reg:
                         set_status(row_id, STATUS_CALLED)
                         st.rerun()
 
-                if current_status == STATUS_INROOM:
+                if current_status == STATUS_ARRIVED:
                     with s3:
+                        status_badge("도착", STATUS_ARRIVED)
+                else:
+                    if s3.button("도착", key=f"status_arrived_{i}", use_container_width=True):
+                        set_status(row_id, STATUS_ARRIVED)
+                        st.rerun()
+                        
+                if current_status == STATUS_INROOM:
+                    with s4:
                         status_badge("입실", STATUS_INROOM)
                 else:
-                    if s3.button("입실", key=f"status_in_{i}", use_container_width=True):
+                    if s4.button("입실", key=f"status_in_{i}", use_container_width=True):
                         set_status(row_id, STATUS_INROOM)
                         st.rerun()
 
                 if current_status == STATUS_DONE:
-                    with s4:
+                    with s5:
                         status_badge("완료", STATUS_DONE)
                 else:
-                    if s4.button("완료", key=f"status_done_{i}", use_container_width=True):
+                    if s5.button("완료", key=f"status_done_{i}", use_container_width=True):
                         set_status(row_id, STATUS_DONE)
                         st.rerun()
 
